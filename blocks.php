@@ -313,6 +313,37 @@ foreach ($wpProbePaths as $probe) {
 }
 
 // ---------------------------------------------------------------
+// 5b. BLOCK KNOWN NON-EXISTENT ICON/FAVICON PATHS
+//     Real browsers silently ignore a missing icon — there is never
+//     a legitimate reason to challenge a visitor with the CAPTCHA
+//     puzzle over one of these requests. Catching them here (before
+//     section 6) skips session creation and puzzle generation
+//     entirely, which matters during high-volume bursts that target
+//     these exact files (seen repeatedly: 07/06, 07/16, 08/06).
+//     None of these files exist on this server. Returns a plain 404.
+// ---------------------------------------------------------------
+$iconPaths = [
+    '/favicon.ico',
+    '/apple-touch-icon.png',
+    '/apple-touch-icon-precomposed.png',
+    '/apple-touch-icon-120x120.png',
+    '/apple-touch-icon-120x120-precomposed.png',
+];
+
+if (in_array($requestPath, $iconPaths, true)) {
+    rotate_log($logFile);
+    writelog($logFile, 'BLOCKED', 'ICON_PROBE:' . $requestPath, $visitorIp);
+    http_response_code(404);
+    $custom404 = '/home/yourusername/public_html/404.shtml';
+    if (file_exists($custom404)) {
+        readfile($custom404);
+    } else {
+        echo '<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>';
+    }
+    exit;
+}
+
+// ---------------------------------------------------------------
 // 6. DRAG-AND-DROP PUZZLE CAPTCHA — challenge ALL visitors on first visit
 //    Once solved, the session + cookie lets them through freely.
 //    Skip AJAX endpoints so background requests don't get interrupted.
