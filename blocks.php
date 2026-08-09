@@ -6,6 +6,7 @@
  * S. Secret token bypass for trusted tools (autoposter etc.)
  * 1. Blocks empty / missing user agents
  * 2. Whitelists legitimate search engine bots (Googlebot, DuckDuckBot etc.)
+ * 2b. Rate limits any single IP making too many requests too fast
  * 3. Blocks known bad bots and scrapers by user agent string
  * 4. Blocks outdated Chrome versions used as bot fingerprints
  * 5. Blocks WordPress probe paths (wp-login.php, wp-admin etc.) — site is not WordPress
@@ -165,6 +166,150 @@ function getRealIp(): string {
 }
 
 // ---------------------------------------------------------------
+// RATE LIMITING — hard cap on requests/second from a single IP
+// Uses APCu (in-memory, near-zero overhead) when available, since
+// that's the common case on cPanel/CloudLinux hosting. Falls back
+// to a single small locked file if APCu isn't enabled, so this
+// still works everywhere — just with a little more I/O per request.
+//
+// Tune these three constants to taste:
+//   RATE_LIMIT_MAX_REQUESTS — how many requests are allowed...
+//   RATE_LIMIT_WINDOW_SECONDS — ...within this many seconds...
+//   RATE_LIMIT_LOCKOUT_SECONDS — ...before the IP is hard-blocked
+//                                  for this long.
+// ---------------------------------------------------------------
+const RATE_LIMIT_MAX_REQUESTS    = 25;   // requests
+const RATE_LIMIT_WINDOW_SECONDS  = 10;   // per this many seconds
+const RATE_LIMIT_LOCKOUT_SECONDS = 300;  // then blocked for this long
+
+// Fallback-file store lives next to the log file. Bounded in size
+// (see prune step below) so it can never grow without limit.
+function rateLimitFilePath(string $logFile): string {
+    return dirname($logFile) . '/ratelimit.dat';
+}
+
+function apcuAvailable(): bool {
+    static $available = null;
+    if ($available === null) {
+        $available = function_exists('apcu_fetch')
+            && function_exists('apcu_store')
+            && function_exists('apcu_inc')
+            && @apcu_store('sb_rl_selftest', 1, 5) === true;
+    }
+    return $available;
+}
+
+// Returns 0 if the request is allowed, or the number of seconds
+// remaining in the lockout if this IP should be blocked right now.
+function rateLimitExceeded(string $ip, string $logFile): int {
+    return apcuAvailable()
+        ? rateLimitCheckApcu($ip)
+        : rateLimitCheckFile($ip, $logFile);
+}
+
+function rateLimitCheckApcu(string $ip): int {
+    $now      = time();
+    $lockKey  = 'sb_rl_lock_' . $ip;
+    $countKey = 'sb_rl_count_' . $ip;
+
+    // Already in a lockout from a previous flood? Cheapest possible
+    // exit — one APCu read, nothing else.
+    $lockedUntil = apcu_fetch($lockKey);
+    if ($lockedUntil !== false && $lockedUntil > $now) {
+        return $lockedUntil - $now;
+    }
+
+    // apcu_inc() atomically creates-and-increments in one call —
+    // no separate exists-check needed, and it's concurrency-safe
+    // across PHP-FPM/Apache workers sharing the same memory segment.
+    $count = apcu_inc($countKey, 1, $success, RATE_LIMIT_WINDOW_SECONDS);
+    if (!$success) {
+        apcu_store($countKey, 1, RATE_LIMIT_WINDOW_SECONDS);
+        $count = 1;
+    }
+
+    if ($count > RATE_LIMIT_MAX_REQUESTS) {
+        apcu_store($lockKey, $now + RATE_LIMIT_LOCKOUT_SECONDS, RATE_LIMIT_LOCKOUT_SECONDS);
+        return RATE_LIMIT_LOCKOUT_SECONDS;
+    }
+
+    return 0;
+}
+
+// File-based fallback. Single small file, one flock'd read-modify-
+// write per request. Entries prune themselves on every write so the
+// file can't grow unbounded even under sustained traffic.
+function rateLimitCheckFile(string $ip, string $logFile): int {
+    $path = rateLimitFilePath($logFile);
+    $now  = time();
+
+    $handle = @fopen($path, 'c+');
+    if ($handle === false) {
+        return 0; // Can't open the store — fail open, don't block real visitors
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        return 0; // Fail open rather than risk hanging on lock contention
+    }
+
+    $size = filesize($path);
+    $raw  = $size > 0 ? fread($handle, $size) : '';
+    $data = $raw !== '' ? @unserialize($raw) : [];
+    if (!is_array($data)) {
+        $data = [];
+    }
+
+    // Prune anything whose window AND lockout have both expired, so
+    // the file only ever holds currently-relevant IPs. Cap the total
+    // count as a hard safety net against unbounded growth.
+    foreach ($data as $entryIp => $entry) {
+        $windowExpired  = ($entry['windowStart'] ?? 0) + RATE_LIMIT_WINDOW_SECONDS < $now;
+        $lockoutExpired = ($entry['lockedUntil'] ?? 0) < $now;
+        if ($windowExpired && $lockoutExpired) {
+            unset($data[$entryIp]);
+        }
+    }
+    if (count($data) > 5000) {
+        // Extremely unlikely on a site this size, but bail safely —
+        // drop the oldest half rather than let the file balloon.
+        uasort($data, fn($a, $b) => ($a['windowStart'] ?? 0) <=> ($b['windowStart'] ?? 0));
+        $data = array_slice($data, (int) (count($data) / 2), null, true);
+    }
+
+    $entry = $data[$ip] ?? ['count' => 0, 'windowStart' => $now, 'lockedUntil' => 0];
+
+    $result = 0;
+    if ($entry['lockedUntil'] > $now) {
+        $result = $entry['lockedUntil'] - $now;
+    } else {
+        if ($entry['windowStart'] + RATE_LIMIT_WINDOW_SECONDS < $now) {
+            // Window expired — start a fresh one
+            $entry['count']       = 1;
+            $entry['windowStart'] = $now;
+        } else {
+            $entry['count']++;
+        }
+
+        if ($entry['count'] > RATE_LIMIT_MAX_REQUESTS) {
+            $entry['lockedUntil'] = $now + RATE_LIMIT_LOCKOUT_SECONDS;
+            $result = RATE_LIMIT_LOCKOUT_SECONDS;
+        }
+    }
+
+    $data[$ip] = $entry;
+
+    ftruncate($handle, 0);
+    rewind($handle);
+    fwrite($handle, serialize($data));
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+
+    return $result;
+}
+
+// ---------------------------------------------------------------
 // HELPER — check if visitor already passed CAPTCHA
 // Uses the resolved real IP consistently (Cloudflare-aware, see getRealIp())
 // ---------------------------------------------------------------
@@ -237,6 +382,23 @@ foreach ($allowedBots as $good) {
     if (strpos($uaLower, $good) !== false) {
         return; // Good bot — exit early, no log rotation needed
     }
+}
+
+// ---------------------------------------------------------------
+// 2b. RATE LIMIT — hard cap on requests/second from a single IP.
+//    Placed here (after the good-bot whitelist, before the heavier
+//    checks) so a flooding client is rejected as cheaply as possible:
+//    no old-Chrome regex, no WP-probe loop, and critically, no
+//    CAPTCHA session/puzzle generation.
+// ---------------------------------------------------------------
+$retryAfter = rateLimitExceeded($visitorIp, $logFile);
+if ($retryAfter > 0) {
+    rotate_log($logFile);
+    writelog($logFile, 'BLOCKED', 'RATE_LIMIT', $visitorIp);
+    http_response_code(429);
+    header('Retry-After: ' . $retryAfter);
+    echo '<!DOCTYPE html><html><head><title>429 Too Many Requests</title></head><body><h1>429 Too Many Requests</h1><p>Please slow down and try again shortly.</p></body></html>';
+    exit;
 }
 
 // ---------------------------------------------------------------
