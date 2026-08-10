@@ -39,6 +39,11 @@ if (!isset($_SESSION['puzzle_slots'])) {
     $_SESSION['puzzle_slots'] = $missing;  // e.g. [0,2,4] — correct slot per piece index
     $_SESSION['puzzle_order'] = $order;    // e.g. [2,0,1] — display order in tray
     $_SESSION['puzzle_theme'] = rand(0, 5);
+    $_SESSION['puzzle_started_at'] = time();
+}
+
+if (isset($_SESSION['puzzle_slots']) && !isset($_SESSION['puzzle_started_at'])) {
+    $_SESSION['puzzle_started_at'] = time();
 }
 
 // ── CSRF ─────────────────────────────────────────────────────────
@@ -52,12 +57,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['answers']) && empty($
     if (!$csrf_ok) {
         $error = "Security token mismatch — please refresh and try again.";
     } else {
+        $minSeconds = defined('CAPTCHA_MIN_SECONDS') ? CAPTCHA_MIN_SECONDS : 3;
+        $startedAt  = (int)($_SESSION['puzzle_started_at'] ?? 0);
+        $interacted = ($_POST['puzzle_interacted'] ?? '') === '1';
+        $elapsed    = $now - $startedAt;
+        $gateOk     = $interacted && $startedAt > 0 && $elapsed >= $minSeconds;
+
+        if (!$gateOk) {
+            $error = "Please drag each piece into place to continue.";
+            $correct = false;
+        } else {
         // answers is JSON array of {piece_index, slot_index} pairs
         $submitted = json_decode($_POST['answers'], true);
         $expected  = $_SESSION['puzzle_slots']; // [slot0, slot1, slot2] sorted
 
         $correct = false;
-        $tray_order = $_SESSION['puzzle_order']; // e.g. [2,0,1] — display order
         if (is_array($submitted) && count($submitted) === 3) {
             // submitted is an ordered array — element 0 was placed first, 1 second, 2 third.
             // For correct answer:
@@ -75,9 +89,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['answers']) && empty($
                 if ($slotIdx !== ($expected[$pieceIdx] ?? -99)) { $correct = false; break; }
             }
         }
+        }
 
         if ($correct) {
             unset($_SESSION['puzzle_slots'], $_SESSION['puzzle_theme'],
+                  $_SESSION['puzzle_started_at'],
                   $_SESSION['captcha_csrf'], $_SESSION['captcha_fails'],
                   $_SESSION['captcha_fail_time'], $_SESSION['captcha_locked_until'],
                   $_SESSION['already_logged']);
@@ -86,13 +102,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['answers']) && empty($
 
             $is_https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
                         || ($_SERVER['SERVER_PORT'] ?? '') === '443';
-            foreach (['human_ticket' => true, 'human_ticket_mobile' => false] as $name => $httponly) {
-                setcookie($name, 'verified', [
-                    'expires' => time()+86400, 'path' => '/',
-                    'httponly' => $httponly, 'secure' => $is_https, 'samesite' => 'Lax',
-                ]);
-            }
-            $redirect = htmlspecialchars($_SESSION['blocked_uri'] ?? '/', ENT_QUOTES, 'UTF-8');
+            $ticketTtl = defined('TICKET_TTL_SECONDS') ? TICKET_TTL_SECONDS : 86400;
+            $cookieOpts = [
+                'expires'  => time() + $ticketTtl,
+                'path'     => '/',
+                'httponly' => true,
+                'secure'   => $is_https,
+                'samesite' => 'Lax',
+            ];
+            setcookie('human_ticket', issueHumanTicket($visitor_ip), $cookieOpts);
+            // Retire legacy static cookies from earlier versions
+            setcookie('human_ticket_mobile', '', ['expires' => 1, 'path' => '/']);
+            $redirect = htmlspecialchars(
+                safeRedirectPath($_SESSION['blocked_uri'] ?? '/'),
+                ENT_QUOTES,
+                'UTF-8'
+            );
             unset($_SESSION['blocked_uri']);
 
             // Meta refresh instead of Refresh header — mobile browsers (especially
@@ -118,7 +143,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['answers']) && empty($
                 $_SESSION['captcha_locked_until'] = $now + 60;
                 $_SESSION['captcha_fails']        = 0;
                 $error = "Too many incorrect attempts. Please wait 60 seconds and try again.";
-            } else {
+            } elseif ($gateOk) {
                 $remaining = 5 - $fail_count;
                 $error = "Incorrect placement — try again. ({$remaining} attempt" . ($remaining===1?'':'s') . " remaining)";
             }
@@ -129,6 +154,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['answers']) && empty($
             $_SESSION['puzzle_slots'] = $missing;
             $_SESSION['puzzle_order'] = $order;
             $_SESSION['puzzle_theme'] = rand(0, 5);
+            $_SESSION['puzzle_started_at'] = time();
             $_SESSION['captcha_csrf'] = bin2hex(random_bytes(16));
         }
     }
@@ -286,6 +312,7 @@ p.subtitle{font-size:.82rem;color:rgba(255,255,255,.36);margin-bottom:22px;line-
 
     <form method="POST" action="" id="verify-form">
         <input type="hidden" name="answers" id="answersInput" value="">
+        <input type="hidden" name="puzzle_interacted" id="puzzleInteracted" value="0">
         <input type="hidden" name="captcha_csrf" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
     </form>
 
@@ -634,6 +661,11 @@ p.subtitle{font-size:.82rem;color:rgba(255,255,255,.36);margin-bottom:22px;line-
     let   placedCount = 0;
     let   nextExpectedLabel = 1; // which tray label must be placed next (1, then 2, then 3)
 
+    function markPuzzleInteracted() {
+        const el = document.getElementById('puzzleInteracted');
+        if (el) el.value = '1';
+    }
+
     // ── Build UI ──────────────────────────────────────────────────
     const board    = document.getElementById('puzzleBoard');
     const tray     = document.getElementById('pieceTray');
@@ -713,6 +745,7 @@ p.subtitle{font-size:.82rem;color:rgba(255,255,255,.36);margin-bottom:22px;line-
 
             // Desktop drag
             wrap.addEventListener('dragstart', e => {
+                markPuzzleInteracted();
                 dragging = { pieceIndex: pieceIdx, el: wrap };
                 e.dataTransfer.setData('text/plain', pieceIdx);
                 e.dataTransfer.effectAllowed = 'move';
@@ -735,6 +768,7 @@ p.subtitle{font-size:.82rem;color:rgba(255,255,255,.36);margin-bottom:22px;line-
             // Touch drag
             wrap.addEventListener('touchstart', e => {
                 if (wrap.classList.contains('used')) return;
+                markPuzzleInteracted();
                 dragging = { pieceIndex: pieceIdx, el: wrap };
                 ghost.style.display = 'block';
                 ghost.style.width  = cWrap.offsetWidth  + 'px';
