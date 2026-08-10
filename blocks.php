@@ -14,6 +14,7 @@
  *
  * Logs BLOCKED and CAPTCHA events to alist.txt — one line per entry.
  * Add to .htaccess: php_value auto_prepend_file /home/yourusername/public_html/blocks.php
+ * Optional: SetEnv SMARTBLOCKER_SECRET your_random_secret_here
  */
 
 // ---------------------------------------------------------------
@@ -182,6 +183,10 @@ const RATE_LIMIT_MAX_REQUESTS    = 25;   // requests
 const RATE_LIMIT_WINDOW_SECONDS  = 10;   // per this many seconds
 const RATE_LIMIT_LOCKOUT_SECONDS = 300;  // then blocked for this long
 
+// CAPTCHA / verification ticket tuning
+const CAPTCHA_MIN_SECONDS = 3;     // minimum time on puzzle before submit accepted
+const TICKET_TTL_SECONDS  = 86400; // human_ticket cookie lifetime (24 hours)
+
 // Fallback-file store lives next to the log file. Bounded in size
 // (see prune step below) so it can never grow without limit.
 function rateLimitFilePath(string $logFile): string {
@@ -310,6 +315,67 @@ function rateLimitCheckFile(string $ip, string $logFile): int {
 }
 
 // ---------------------------------------------------------------
+// HELPER — signed human_ticket cookie (replaces static "verified" string)
+// Set SMARTBLOCKER_SECRET in .htaccess/httpd.conf; falls back to a derived
+// server-local secret if unset so the site still works out of the box.
+// ---------------------------------------------------------------
+function ticketSecret(): string {
+    static $secret = null;
+    if ($secret === null) {
+        $env = getenv('SMARTBLOCKER_SECRET') ?: '';
+        $secret = $env !== ''
+            ? $env
+            : hash('sha256', __DIR__ . '|smartblocker|' . (getenv('AUTOPOSTER_TOKEN') ?: php_uname('n')), true);
+    }
+    return $secret;
+}
+
+function issueHumanTicket(string $ip): string {
+    $exp     = time() + TICKET_TTL_SECONDS;
+    $nonce   = bin2hex(random_bytes(8));
+    $payload = $ip . '|' . $exp . '|' . $nonce;
+    $sig     = hash_hmac('sha256', $payload, ticketSecret());
+    return rtrim(strtr(base64_encode($payload . '|' . $sig), '+/', '-_'), '=');
+}
+
+function validateHumanTicket(?string $token, string $ip): bool {
+    if ($token === null || $token === '') {
+        return false;
+    }
+    $decoded = base64_decode(strtr($token, '-_', '+/'), true);
+    if ($decoded === false) {
+        return false;
+    }
+    $parts = explode('|', $decoded);
+    if (count($parts) !== 4) {
+        return false;
+    }
+    [$ticketIp, $exp, $nonce, $sig] = $parts;
+    if (!filter_var($ticketIp, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    $payload = $ticketIp . '|' . $exp . '|' . $nonce;
+    if (!hash_equals(hash_hmac('sha256', $payload, ticketSecret()), $sig)) {
+        return false;
+    }
+    if ($ticketIp !== $ip || (int) $exp < time()) {
+        return false;
+    }
+    return true;
+}
+
+function safeRedirectPath(string $uri): string {
+    $path = strtok($uri, '?') ?: '/';
+    if ($path === '' || $path[0] !== '/' || (isset($path[1]) && $path[1] === '/')) {
+        return '/';
+    }
+    if (strpbrk($path, "\\\r\n\t@:") !== false) {
+        return '/';
+    }
+    return $path;
+}
+
+// ---------------------------------------------------------------
 // HELPER — check if visitor already passed CAPTCHA
 // Uses the resolved real IP consistently (Cloudflare-aware, see getRealIp())
 // ---------------------------------------------------------------
@@ -317,10 +383,7 @@ function already_verified(string $ip): bool {
     if (!empty($_SESSION['verified_human']) && ($_SESSION['verified_ip'] ?? '') === $ip) {
         return true;
     }
-    if (!empty($_COOKIE['human_ticket']) && $_COOKIE['human_ticket'] === 'verified') {
-        return true;
-    }
-    if (!empty($_COOKIE['human_ticket_mobile']) && $_COOKIE['human_ticket_mobile'] === 'verified') {
+    if (validateHumanTicket($_COOKIE['human_ticket'] ?? null, $ip)) {
         return true;
     }
     return false;
@@ -342,7 +405,7 @@ function serve_captcha(string $logFile, string $reason, string $ip): void {
 // Autoposter sends header: X-Autoposter-Token: <token> to bypass all checks silently
 // ---------------------------------------------------------------
 $secretToken = getenv('AUTOPOSTER_TOKEN') ?: '';
-if ($secretToken !== '' && ($_SERVER['HTTP_X_AUTOPOSTER_TOKEN'] ?? '') === $secretToken) {
+if ($secretToken !== '' && hash_equals($secretToken, $_SERVER['HTTP_X_AUTOPOSTER_TOKEN'] ?? '')) {
     return; // Trusted request — skip everything silently
 }
 
