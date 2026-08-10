@@ -66,6 +66,15 @@ function rotate_log(string $logFile): void {
 }
 
 function writelog(string $logFile, string $status, string $reason, string $ip): void {
+    // Never log requests to snap.php — its URL carries a secret access
+    // token (?token=...), and that token should never be written to
+    // alist.txt in plain text. The CAPTCHA/rate-limit gate above this
+    // call still runs as normal; only the logging is skipped.
+    $requestPath = strtok($_SERVER['REQUEST_URI'] ?? '', '?');
+    if (basename($requestPath) === 'snap.php') {
+        return;
+    }
+
     $date    = date('Y-m-d H:i:s');
     $method  = $_SERVER['REQUEST_METHOD']  ?? '-';
     $scheme  = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
@@ -365,14 +374,27 @@ function validateHumanTicket(?string $token, string $ip): bool {
 }
 
 function safeRedirectPath(string $uri): string {
-    $path = strtok($uri, '?') ?: '/';
+    $parts = explode('?', $uri, 2);
+    $path  = $parts[0] !== '' ? $parts[0] : '/';
+    $query = $parts[1] ?? '';
+
     if ($path === '' || $path[0] !== '/' || (isset($path[1]) && $path[1] === '/')) {
         return '/';
     }
     if (strpbrk($path, "\\\r\n\t@:") !== false) {
         return '/';
     }
-    return $path;
+
+    // The open-redirect risk lives entirely in the path/host above — a
+    // query string can't send the browser to a different origin — so
+    // it's safe to keep, e.g. so ?token=... survives the CAPTCHA
+    // redirect for tools like snap.php. Still strip control characters
+    // to keep the reconstructed URL well-formed.
+    if ($query !== '' && strpbrk($query, "\\\r\n\t") !== false) {
+        $query = '';
+    }
+
+    return $query !== '' ? $path . '?' . $query : $path;
 }
 
 // ---------------------------------------------------------------
